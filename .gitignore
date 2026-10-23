@@ -1,0 +1,14 @@
+node_modules/
+build/
+dist/
+coverage/
+.data/
+.snapshots/
+.DS_Store
+*.log
+.env*
+!.env.example
+.bevel/
+.playwright-mcp/
+.aistudio/
+.vscode/
