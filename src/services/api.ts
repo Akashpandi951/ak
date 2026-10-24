@@ -50,10 +50,15 @@ export function setAuthToken(token: string) {
 }
 
 export function clearAuthToken() {
+  const tokenToClear = tabAuthToken;
   tabAuthToken = null;
   try {
     sessionStorage.removeItem(TOKEN_KEY);
-    localStorage.removeItem(TOKEN_KEY);
+    // Only remove from localStorage if it matches this tab's token,
+    // preserving other logged-in tabs during multi-account local testing!
+    if (tokenToClear && localStorage.getItem(TOKEN_KEY) === tokenToClear) {
+      localStorage.removeItem(TOKEN_KEY);
+    }
   } catch {
     // Ignore storage access errors
   }
@@ -398,6 +403,7 @@ class WebSocketClient {
   private subscribedRooms: Set<string> = new Set();
   private reconnectTimer: any = null;
   private currentToken: string | null = null;
+  private isAuthenticated = false;
 
   connect(token?: string) {
     const authToken = token || getAuthToken();
@@ -413,6 +419,7 @@ class WebSocketClient {
     ) {
       this.socket.close();
       this.socket = null;
+      this.isAuthenticated = false;
     }
 
     if (
@@ -424,6 +431,7 @@ class WebSocketClient {
     }
 
     this.currentToken = authToken;
+    this.isAuthenticated = false;
     let wsUrl: string;
     const backendBase = (import.meta.env.VITE_BACKEND_URL || import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
     if (backendBase) {
@@ -452,7 +460,8 @@ class WebSocketClient {
           const payload = JSON.parse(event.data);
           const { type, ...data } = payload;
           if (type === 'auth_success') {
-            // Re-subscribe to all active rooms on connect/reconnect
+            this.isAuthenticated = true;
+            // Subscribe to all active rooms on connect/reconnect once authorized
             for (const roomId of this.subscribedRooms) {
               this.socket?.send(JSON.stringify({ type: 'join_room', roomId }));
             }
@@ -466,6 +475,7 @@ class WebSocketClient {
 
       this.socket.onclose = () => {
         this.socket = null;
+        this.isAuthenticated = false;
         clearTimeout(this.reconnectTimer);
         this.reconnectTimer = setTimeout(() => {
           const activeToken = getAuthToken();
@@ -486,9 +496,9 @@ class WebSocketClient {
   subscribeRoom(roomId: string) {
     if (!roomId) return;
     this.subscribedRooms.add(roomId);
-    if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+    if (this.socket && this.socket.readyState === WebSocket.OPEN && this.isAuthenticated) {
       this.socket.send(JSON.stringify({ type: 'join_room', roomId }));
-    } else {
+    } else if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
       this.connect();
     }
   }
@@ -534,6 +544,7 @@ class WebSocketClient {
   disconnect() {
     clearTimeout(this.reconnectTimer);
     this.subscribedRooms.clear();
+    this.isAuthenticated = false;
     if (this.socket) {
       this.socket.close();
       this.socket = null;

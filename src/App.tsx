@@ -1,21 +1,48 @@
 /**
  * ChessVerse 3D - Full-Stack Gaming Platform Master Component
  */
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, Suspense, lazy } from 'react';
 import { UserProfile, GameInvitation, Conversation, MatchHistoryItem } from './types/index.ts';
 import { api, getAuthToken, clearAuthToken, wsService } from './services/api.ts';
 import { Navbar } from './components/Navbar.tsx';
 import { Sidebar } from './components/Sidebar.tsx';
 import { AuthModal } from './components/AuthModal.tsx';
 import { HomeDashboard } from './components/HomeDashboard.tsx';
-import { Chess3DGame } from './components/Chess3DGame.tsx';
-import { TicTacToeGame } from './components/TicTacToeGame.tsx';
-import { WhatsAppChat } from './components/WhatsAppChat.tsx';
-import { MultiplayerHub } from './components/MultiplayerHub.tsx';
-import { FriendsView } from './components/FriendsView.tsx';
-import { LeaderboardView } from './components/LeaderboardView.tsx';
-import { ProfileModal } from './components/ProfileModal.tsx';
-import { SettingsModal } from './components/SettingsModal.tsx';
+
+// Code-split heavy components for instant initial page loading & reduced memory footprint
+const Chess3DGame = lazy(() =>
+  import('./components/Chess3DGame.tsx').then((m) => ({ default: m.Chess3DGame }))
+);
+const TicTacToeGame = lazy(() =>
+  import('./components/TicTacToeGame.tsx').then((m) => ({ default: m.TicTacToeGame }))
+);
+const WhatsAppChat = lazy(() =>
+  import('./components/WhatsAppChat.tsx').then((m) => ({ default: m.WhatsAppChat }))
+);
+const MultiplayerHub = lazy(() =>
+  import('./components/MultiplayerHub.tsx').then((m) => ({ default: m.MultiplayerHub }))
+);
+const FriendsView = lazy(() =>
+  import('./components/FriendsView.tsx').then((m) => ({ default: m.FriendsView }))
+);
+const LeaderboardView = lazy(() =>
+  import('./components/LeaderboardView.tsx').then((m) => ({ default: m.LeaderboardView }))
+);
+const ProfileModal = lazy(() =>
+  import('./components/ProfileModal.tsx').then((m) => ({ default: m.ProfileModal }))
+);
+const SettingsModal = lazy(() =>
+  import('./components/SettingsModal.tsx').then((m) => ({ default: m.SettingsModal }))
+);
+
+const ViewFallback = () => (
+  <div className="flex-1 flex items-center justify-center p-12 min-h-[400px]">
+    <div className="flex flex-col items-center gap-3">
+      <div className="w-10 h-10 border-2 border-cyan-400 border-t-transparent rounded-full animate-spin" />
+      <span className="text-xs font-bold text-cyan-300 tracking-widest uppercase">Loading Module...</span>
+    </div>
+  </div>
+);
 
 export default function App() {
   const [currentUser, setCurrentUser] = useState<UserProfile | null>(null);
@@ -97,6 +124,7 @@ export default function App() {
       const requestedGame = urlParams.get('game');
 
       if (requestedUser) {
+        clearAuthToken();
         try {
           const res = await api.login(requestedUser, 'chessverse123');
           setCurrentUser(res.user);
@@ -176,7 +204,12 @@ export default function App() {
 
       wsService.on('invitation_accepted', (data: any) => {
         const gameType = data.gameType || 'chess';
+        showToast(`${data.accepter?.username || 'Opponent'} accepted! Starting match...`);
         handleNavigate(gameType === 'chess' ? 'chess' : 'ttt', { roomId: data.roomId });
+      }),
+
+      wsService.on('invitation_declined', () => {
+        showToast('Your game challenge was declined.');
       }),
 
       wsService.on('new_message', () => {
@@ -237,7 +270,11 @@ export default function App() {
   const handleInviteFriend = async (targetUserId: string, gameType: 'chess' | 'ttt') => {
     try {
       const res = await api.sendInvitation(targetUserId, gameType);
-      handleNavigate(gameType === 'chess' ? 'chess' : 'ttt', { roomId: res.room.id });
+      if (res.invitation?.status === 'accepted') {
+        handleNavigate(gameType === 'chess' ? 'chess' : 'ttt', { roomId: res.room.id });
+      } else {
+        showToast('Challenge sent! Match will start once accepted.');
+      }
     } catch (err: any) {
       showToast(err.message || 'Failed to send game challenge');
     }
@@ -347,103 +384,109 @@ export default function App() {
             />
           )}
 
-          {activeView === 'chess' && (
-            <Chess3DGame
-              key={viewParams.roomId || 'chess-local'}
-              currentUser={currentUser}
-              initialRoomId={viewParams.roomId}
-              onExit={() => {
-                refreshAppData();
-                handleNavigate('dashboard');
-              }}
-              onNavigateChat={(userId) => handleNavigate('chat', { targetUserId: userId })}
-            />
-          )}
+          <Suspense fallback={<ViewFallback />}>
+            {activeView === 'chess' && (
+              <Chess3DGame
+                key={viewParams.roomId || 'chess-local'}
+                currentUser={currentUser}
+                initialRoomId={viewParams.roomId}
+                onExit={() => {
+                  refreshAppData();
+                  handleNavigate('dashboard');
+                }}
+                onNavigateChat={(userId) => handleNavigate('chat', { targetUserId: userId })}
+              />
+            )}
 
-          {activeView === 'ttt' && (
-            <TicTacToeGame
-              key={viewParams.roomId || 'ttt-local'}
-              currentUser={currentUser}
-              initialRoomId={viewParams.roomId}
-              onExit={() => {
-                refreshAppData();
-                handleNavigate('dashboard');
-              }}
-              onNavigateChat={(userId) => handleNavigate('chat', { targetUserId: userId })}
-            />
-          )}
+            {activeView === 'ttt' && (
+              <TicTacToeGame
+                key={viewParams.roomId || 'ttt-local'}
+                currentUser={currentUser}
+                initialRoomId={viewParams.roomId}
+                onExit={() => {
+                  refreshAppData();
+                  handleNavigate('dashboard');
+                }}
+                onNavigateChat={(userId) => handleNavigate('chat', { targetUserId: userId })}
+              />
+            )}
 
-          {activeView === 'chat' && (
-            <WhatsAppChat
-              key={viewParams.targetUserId || 'chat'}
-              currentUser={currentUser}
-              initialTargetUserId={viewParams.targetUserId}
-              onInviteGame={handleInviteFriend}
-              onBackToDashboard={() => handleNavigate('dashboard')}
-            />
-          )}
+            {activeView === 'chat' && (
+              <WhatsAppChat
+                key={viewParams.targetUserId || 'chat'}
+                currentUser={currentUser}
+                initialTargetUserId={viewParams.targetUserId}
+                onInviteGame={handleInviteFriend}
+                onBackToDashboard={() => handleNavigate('dashboard')}
+              />
+            )}
 
-          {activeView === 'multiplayer' && (
-            <MultiplayerHub
-              currentUser={currentUser}
-              onStartGame={(gameType, roomId) =>
-                handleNavigate(gameType === 'chess' ? 'chess' : 'ttt', { roomId })
-              }
-              onInviteFriend={handleInviteFriend}
-              friends={friends}
-            />
-          )}
+            {activeView === 'multiplayer' && (
+              <MultiplayerHub
+                currentUser={currentUser}
+                onStartGame={(gameType, roomId) =>
+                  handleNavigate(gameType === 'chess' ? 'chess' : 'ttt', { roomId })
+                }
+                onInviteFriend={handleInviteFriend}
+                friends={friends}
+              />
+            )}
 
-          {activeView === 'friends' && (
-            <FriendsView
-              currentUser={currentUser}
-              friends={friends}
-              pendingRequests={pendingRequests}
-              onRefresh={refreshAppData}
-              onNavigateChat={(userId) => handleNavigate('chat', { targetUserId: userId })}
-              onInviteGame={handleInviteFriend}
-            />
-          )}
+            {activeView === 'friends' && (
+              <FriendsView
+                currentUser={currentUser}
+                friends={friends}
+                pendingRequests={pendingRequests}
+                onRefresh={refreshAppData}
+                onNavigateChat={(userId) => handleNavigate('chat', { targetUserId: userId })}
+                onInviteGame={handleInviteFriend}
+              />
+            )}
 
-          {activeView === 'leaderboard' && (
-            <LeaderboardView
-              currentUser={currentUser}
-              leaderboard={leaderboard}
-              onInviteGame={handleInviteFriend}
-              onNavigateChat={(userId) => handleNavigate('chat', { targetUserId: userId })}
-            />
-          )}
+            {activeView === 'leaderboard' && (
+              <LeaderboardView
+                currentUser={currentUser}
+                leaderboard={leaderboard}
+                onInviteGame={handleInviteFriend}
+                onNavigateChat={(userId) => handleNavigate('chat', { targetUserId: userId })}
+              />
+            )}
 
-          {activeView === 'settings' && (
-            <SettingsModal
-              currentUser={currentUser}
-              onClose={() => handleNavigate('dashboard')}
-              onLogout={handleLogout}
-              onDeleteAccount={handleDeleteAccount}
-              onUpdateUser={(updated) => setCurrentUser(updated)}
-            />
-          )}
+            {activeView === 'settings' && (
+              <SettingsModal
+                currentUser={currentUser}
+                onClose={() => handleNavigate('dashboard')}
+                onLogout={handleLogout}
+                onDeleteAccount={handleDeleteAccount}
+                onUpdateUser={(updated) => setCurrentUser(updated)}
+              />
+            )}
+          </Suspense>
         </main>
       </div>
 
       {/* Profile Modal */}
       {showProfileModal && (
-        <ProfileModal
-          currentUser={currentUser}
-          onClose={() => setShowProfileModal(false)}
-          onUpdate={(updated) => setCurrentUser(updated)}
-        />
+        <Suspense fallback={null}>
+          <ProfileModal
+            currentUser={currentUser}
+            onClose={() => setShowProfileModal(false)}
+            onUpdate={(updated) => setCurrentUser(updated)}
+          />
+        </Suspense>
       )}
 
       {/* Settings Modal */}
       {showSettingsModal && (
-        <SettingsModal
-          currentUser={currentUser}
-          onClose={() => setShowSettingsModal(false)}
-          onLogout={handleLogout}
-          onDeleteAccount={handleDeleteAccount}
-          onUpdateUser={(updated) => setCurrentUser(updated)}
-        />
+        <Suspense fallback={null}>
+          <SettingsModal
+            currentUser={currentUser}
+            onClose={() => setShowSettingsModal(false)}
+            onLogout={handleLogout}
+            onDeleteAccount={handleDeleteAccount}
+            onUpdateUser={(updated) => setCurrentUser(updated)}
+          />
+        </Suspense>
       )}
     </div>
   );

@@ -134,6 +134,33 @@ const IS_SOFTWARE_GL = (() => {
   }
 })();
 
+// Helper to recursively dispose geometries, materials, and textures to prevent WebGL memory leaks
+function disposeHierarchy(obj: THREE.Object3D) {
+  obj.traverse((child) => {
+    if ((child as THREE.Mesh).isMesh) {
+      const mesh = child as THREE.Mesh;
+      if (mesh.geometry) {
+        mesh.geometry.dispose();
+      }
+      if (mesh.material) {
+        if (Array.isArray(mesh.material)) {
+          mesh.material.forEach((m) => {
+            if ('map' in m && m.map && (m.map as THREE.Texture).dispose) {
+              (m.map as THREE.Texture).dispose();
+            }
+            m.dispose();
+          });
+        } else {
+          if ('map' in mesh.material && mesh.material.map && (mesh.material.map as THREE.Texture).dispose) {
+            (mesh.material.map as THREE.Texture).dispose();
+          }
+          mesh.material.dispose();
+        }
+      }
+    }
+  });
+}
+
 // High-Detail Recognizable Staunton SVG Silhouettes for 2D Mode
 const StauntonPieceSVG: React.FC<{ type: string; color: 'w' | 'b' }> = ({ type, color }) => {
   const fill = color === 'w' ? '#f8fafc' : '#0f172a';
@@ -532,6 +559,7 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
   const legalMovesRef = useRef<any[]>([]);
   const is3DViewRef = useRef<boolean>(is3DView);
   const isSubmittingMoveRef = useRef<boolean>(false);
+  const moveHistoryListRef = useRef<HTMLDivElement>(null);
 
   // Three.js refs
   const mountRef = useRef<HTMLDivElement>(null);
@@ -887,6 +915,13 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
     prevChatCountRef.current = chatMessages.length;
   }, [chatMessages]);
 
+  // Scroll ONLY the internal move history container when moves are added — NEVER expand parent containers or scroll viewport
+  useEffect(() => {
+    if (moveHistoryListRef.current) {
+      moveHistoryListRef.current.scrollTop = moveHistoryListRef.current.scrollHeight;
+    }
+  }, [gameState.history.length]);
+
   // Trigger transient source & destination square highlights + 2D piece glide + special move effects,
   // then automatically remove the source/destination move highlights once the move completes!
   const triggerMovePresentation = useCallback(
@@ -935,14 +970,14 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
         rookTo,
       });
 
-      // Automatically remove the source & destination highlights once the move animation is complete (520ms)
+      // Automatically remove the source & destination highlights once the move animation is complete (420ms)
       if (moveHighlightTimerRef.current) {
         clearTimeout(moveHighlightTimerRef.current);
       }
       moveHighlightTimerRef.current = setTimeout(() => {
         setLastMoveSquares(null);
         setActive2DMove(null);
-      }, 520);
+      }, 420);
 
       // 3. Trigger distinct special visual effects for Checkmate, Promotion, Castling, Capture, or Check
       const pieceNames: Record<string, string> = {
@@ -1191,7 +1226,7 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.02;
     renderer.shadowMap.enabled = !IS_SOFTWARE_GL && graphicsQuality !== 'performance';
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.shadowMap.type = THREE.PCFShadowMap;
 
     const maxAniso = renderer.capabilities.getMaxAnisotropy?.() || 4;
 
@@ -1871,31 +1906,6 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
       typeof window !== 'undefined' &&
       window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
 
-    const afterDraw = (cb: () => void) => {
-      if (isDisposed) return;
-      const gl = renderer.getContext() as WebGL2RenderingContext;
-      if (!gl || typeof gl.fenceSync !== 'function') {
-        frameId = window.setTimeout(cb, 80);
-        return;
-      }
-      const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
-      gl.flush();
-      const poll = () => {
-        if (isDisposed) {
-          if (sync) gl.deleteSync(sync);
-          return;
-        }
-        const state = sync && gl.getSyncParameter(sync, gl.SYNC_STATUS);
-        if (state === gl.UNSIGNALED) {
-          frameId = window.setTimeout(poll, 5);
-        } else {
-          if (sync) gl.deleteSync(sync);
-          frameId = window.setTimeout(cb, 80);
-        }
-      };
-      frameId = window.setTimeout(poll, 5);
-    };
-
     const animate = () => {
       if (isDisposed) return;
 
@@ -2004,8 +2014,12 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
         const isHovered = sq === hoveredSq && !isSelected;
         const isBeingDragged = sq === activeDragSquare && activeDragWorldPos !== null;
 
-        const homeX = FILES.indexOf(sq[0]) - 3.5;
-        const homeZ = 3.5 - RANKS.indexOf(sq[1]);
+        const f = FILES.indexOf(sq[0]);
+        const r = 7 - RANKS.indexOf(sq[1]);
+        const dispF = boardFlippedRef.current ? 7 - f : f;
+        const dispR = boardFlippedRef.current ? 7 - r : r;
+        const homeX = dispF - 3.5;
+        const homeZ = dispR - 3.5;
         const targetX = isBeingDragged && activeDragWorldPos ? activeDragWorldPos.x : homeX;
         const targetZ = isBeingDragged && activeDragWorldPos ? activeDragWorldPos.z : homeZ;
 
@@ -2016,13 +2030,12 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
             : isHovered
               ? 0.115
               : 0.07;
-        const targetScale = isBeingDragged ? 1.07 : isSelected ? 1.055 : isHovered ? 1.02 : 1.0;
 
         mesh.position.x += (targetX - mesh.position.x) * damp;
         mesh.position.z += (targetZ - mesh.position.z) * damp;
         mesh.position.y += (targetY - mesh.position.y) * damp;
-        const nextScale = mesh.scale.x + (targetScale - mesh.scale.x) * damp;
-        mesh.scale.setScalar(nextScale);
+        // Keep piece scale fixed at 1.0 without enlarging or distorting during selection, hover, or drag
+        mesh.scale.setScalar(1.0);
 
         const innerGroup = mesh.children[0] as THREE.Object3D | undefined;
         if (innerGroup) {
@@ -2056,6 +2069,8 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
           if (t < 1) {
             remainingCaps.push(cap);
           } else {
+            disposeHierarchy(cap.mesh);
+            disposeHierarchy(cap.ring);
             cap.mesh.parent?.remove(cap.mesh);
             cap.ring.parent?.remove(cap.ring);
           }
@@ -2089,6 +2104,7 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
           if (t < 1) {
             remainingEffects.push(eff);
           } else {
+            disposeHierarchy(eff.mesh);
             eff.mesh.parent?.remove(eff.mesh);
           }
         }
@@ -2117,11 +2133,7 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
       }
 
       renderer.render(scene, camera);
-      if (IS_SOFTWARE_GL) {
-        afterDraw(animate);
-      } else {
-        frameId = requestAnimationFrame(animate);
-      }
+      frameId = requestAnimationFrame(animate);
     };
     animate();
 
@@ -2166,6 +2178,8 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
       highlightsGroupRef.current = null;
       effectsGroupRef.current = null;
       hoverHighlightMeshRef.current = null;
+      disposeHierarchy(scene);
+      backdropTex.dispose();
       envTarget.dispose();
       renderer.dispose();
       if (renderer.domElement && renderer.domElement.parentNode) {
@@ -2300,28 +2314,21 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
           if (anim.pieceType === 'n') {
             const jumpSin = Math.sin(rawT * Math.PI);
             liftY = Math.pow(jumpSin, 0.82) * 0.95;
-            scaleBoost = 1.0 + jumpSin * 0.22;
             pitchTilt = Math.sin(rawT * Math.PI * 2) * 0.16;
             bankRoll = Math.sin(rawT * Math.PI) * 0.1;
           } else if (anim.pieceType === 'q') {
             const glideSin = Math.sin(rawT * Math.PI);
             liftY = glideSin * 0.26;
-            scaleBoost = 1.0 + glideSin * 0.12;
             pitchTilt = Math.sin(rawT * Math.PI * 2) * 0.05;
           } else {
             const glideSin = Math.sin(rawT * Math.PI);
             liftY = glideSin * 0.22;
-            scaleBoost = 1.0 + glideSin * 0.1;
             pitchTilt = Math.sin(rawT * Math.PI * 2) * 0.04;
-          }
-
-          if (anim.isPromotion) {
-            scaleBoost += Math.sin(rawT * Math.PI) * 0.18;
           }
 
           pos.y = 0.06 + liftY;
           anim.mesh.position.copy(pos);
-          anim.mesh.scale.setScalar(scaleBoost);
+          anim.mesh.scale.setScalar(1.0);
           anim.mesh.rotation.x = pitchTilt;
           anim.mesh.rotation.z = bankRoll;
           animatingMeshes.add(anim.mesh);
@@ -2374,21 +2381,18 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
           mesh.position.x += (dragState.worldX - mesh.position.x) * 0.45;
           mesh.position.z += (dragState.worldZ - mesh.position.z) * 0.45;
           mesh.position.y += (0.38 - mesh.position.y) * 0.35;
-          const nextScale = mesh.scale.x + (1.14 - mesh.scale.x) * 0.3;
-          mesh.scale.setScalar(nextScale);
+          mesh.scale.setScalar(1.0);
         } else if (sq === currentSelected) {
           const hoverBob = Math.sin(now * 0.005) * 0.025;
           mesh.position.x += (basePos.x - mesh.position.x) * 0.28;
           mesh.position.z += ((basePos.z - 0.08) - mesh.position.z) * 0.28;
           mesh.position.y += (0.28 + hoverBob - mesh.position.y) * 0.25;
-          const nextScale = mesh.scale.x + (1.09 - mesh.scale.x) * 0.25;
-          mesh.scale.setScalar(nextScale);
+          mesh.scale.setScalar(1.0);
         } else {
           mesh.position.x += (basePos.x - mesh.position.x) * 0.28;
           mesh.position.z += (basePos.z - mesh.position.z) * 0.28;
           mesh.position.y += (0.06 - mesh.position.y) * 0.25;
-          const nextScale = mesh.scale.x + (1.0 - mesh.scale.x) * 0.25;
-          mesh.scale.setScalar(nextScale);
+          mesh.scale.setScalar(1.0);
         }
       });
 
@@ -2933,12 +2937,13 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
     flags?: string;
     captured?: string | null;
   }) => {
-    rebuild2DMode3DPieces(animatedMove);
     const group = piecesGroupRef.current;
     if (!group) return;
 
     while (group.children.length > 0) {
-      group.remove(group.children[0]);
+      const child = group.children[0];
+      group.remove(child);
+      disposeHierarchy(child);
     }
     pieceMeshesBySquareRef.current.clear();
 
@@ -4406,7 +4411,7 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
       </div>
 
       {/* Move History Card */}
-      <div className="flex-1 flex flex-col p-3 rounded-2xl bg-slate-950/90 border border-cyan-500/25 shadow-xl overflow-hidden min-h-[180px]">
+      <div className="flex-1 min-h-0 max-h-[260px] sm:max-h-[300px] flex flex-col p-3 rounded-2xl bg-slate-950/90 border border-cyan-500/25 shadow-xl overflow-hidden">
         <div className="flex items-center justify-between pb-1.5 mb-2 border-b border-slate-800">
           <h5 className="text-[11px] font-extrabold uppercase tracking-wider text-white">
             Move History
@@ -4415,7 +4420,10 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
             {gameState.history.length} ply
           </span>
         </div>
-        <div className="flex-1 overflow-y-auto space-y-1 font-mono text-[11px] pr-1">
+        <div
+          ref={moveHistoryListRef}
+          className="flex-1 min-h-0 overflow-y-auto space-y-1 font-mono text-[11px] pr-1 overscroll-contain"
+        >
           {gameState.history.length === 0 ? (
             <div className="text-slate-500 text-[11px] py-4 text-center">
               Click a white piece to make your opening move
@@ -4543,27 +4551,26 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
       <style>{`
         @keyframes chess2dPieceGlide {
           0% {
-            transform: translate(calc(var(--glide-dx, 0) * 100%), calc(var(--glide-dy, 0) * 100%)) scale(1.08);
-            filter: drop-shadow(0 12px 16px rgba(34, 211, 238, 0.5));
-          }
-          55% {
-            transform: translate(calc(var(--glide-dx, 0) * 20%), calc(var(--glide-dy, 0) * 20%)) scale(1.16);
+            transform: translate(calc(var(--glide-dx, 0) * 100%), calc(var(--glide-dy, 0) * 100%));
+            filter: drop-shadow(0 8px 12px rgba(34, 211, 238, 0.45));
           }
           100% {
-            transform: translate(0%, 0%) scale(1);
-            filter: drop-shadow(0 3px 5px rgba(0, 0, 0, 0.65));
+            transform: translate(0, 0);
+            filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.5));
           }
         }
         @keyframes chess2dKnightHop {
           0% {
-            transform: translate(calc(var(--glide-dx, 0) * 100%), calc(var(--glide-dy, 0) * 100%)) scale(1.05);
+            transform: translate(calc(var(--glide-dx, 0) * 100%), calc(var(--glide-dy, 0) * 100%));
+            filter: drop-shadow(0 8px 12px rgba(34, 211, 238, 0.45));
           }
           50% {
-            transform: translate(calc(var(--glide-dx, 0) * 42%), calc(var(--glide-dy, 0) * 42% - 14%)) scale(1.26) rotate(-6deg);
-            filter: drop-shadow(0 18px 20px rgba(56, 189, 248, 0.65));
+            transform: translate(calc(var(--glide-dx, 0) * 45%), calc(var(--glide-dy, 0) * 45% - 8px));
+            filter: drop-shadow(0 12px 16px rgba(56, 189, 248, 0.55));
           }
           100% {
-            transform: translate(0%, 0%) scale(1) rotate(0deg);
+            transform: translate(0, 0);
+            filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.5));
           }
         }
         @keyframes chess2dCaptureBurst {
@@ -4653,16 +4660,16 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
 
             <div
               data-testid="white-clock-box"
-              className={`px-3.5 py-1.5 rounded-xl border text-right transition-all ${gameState.turn === myAssignedColor
+              className={`min-w-[108px] h-[52px] px-3 py-1.5 rounded-xl border text-right transition-all flex flex-col justify-center flex-shrink-0 box-border ${gameState.turn === myAssignedColor
                   ? 'bg-cyan-950/80 border-cyan-400 shadow-[0_0_15px_rgba(34,211,238,0.25)]'
                   : 'bg-slate-900/80 border-slate-800'
                 }`}
             >
-              <div className="flex items-center gap-1.5 font-mono text-sm sm:text-base font-black text-white">
+              <div className="flex items-center justify-end gap-1.5 font-mono text-sm sm:text-base font-black text-white leading-none">
                 <Clock className="w-3.5 h-3.5 text-cyan-400" />
                 <span>{formatTime(myAssignedColor === 'w' ? whiteTime : blackTime)}</span>
               </div>
-              <span className="block text-[10px] font-bold text-cyan-300">
+              <span className="block text-[10px] font-bold text-cyan-300 leading-tight truncate whitespace-nowrap mt-0.5">
                 {mode === 'online' && room?.status === 'waiting'
                   ? 'Waiting for Join'
                   : gameState.turn === myAssignedColor
@@ -4687,16 +4694,16 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
           <div className="lg:col-span-5 flex items-center justify-between gap-2">
             <div
               data-testid="black-clock-box"
-              className={`px-3.5 py-1.5 rounded-xl border text-left transition-all ${gameState.turn !== myAssignedColor
+              className={`min-w-[108px] h-[52px] px-3 py-1.5 rounded-xl border text-left transition-all flex flex-col justify-center flex-shrink-0 box-border ${gameState.turn !== myAssignedColor
                   ? 'bg-purple-950/80 border-purple-400 shadow-[0_0_15px_rgba(192,132,252,0.25)]'
                   : 'bg-slate-900/80 border-slate-800'
                 }`}
             >
-              <div className="flex items-center gap-1.5 font-mono text-sm sm:text-base font-black text-white">
+              <div className="flex items-center gap-1.5 font-mono text-sm sm:text-base font-black text-white leading-none">
                 <Clock className="w-3.5 h-3.5 text-purple-400" />
                 <span>{formatTime(myAssignedColor === 'w' ? blackTime : whiteTime)}</span>
               </div>
-              <span className="block text-[10px] font-bold text-purple-300">
+              <span className="block text-[10px] font-bold text-purple-300 leading-tight truncate whitespace-nowrap mt-0.5">
                 {gameState.turn !== myAssignedColor
                   ? `• Opponent Turn (${myAssignedColor === 'w' ? 'Black' : 'White'})`
                   : 'Waiting'}
@@ -4917,7 +4924,7 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
               className={
                 isFullScreen
                   ? 'w-full h-full flex items-center justify-center'
-                  : 'flex-1 p-2 sm:p-4 flex flex-col items-center justify-center gap-2'
+                  : 'flex-1 min-w-0 p-2 sm:p-4 flex flex-col items-center justify-center gap-2'
               }
             >
               {/* Top Player Strip (Positioned above the 8x8 board, hidden in Full-Screen Mode) */}
@@ -4926,20 +4933,23 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
                 className={
                   isFullScreen
                     ? 'hidden'
-                    : 'w-[296px] sm:w-[416px] px-3 py-1.5 rounded-xl bg-slate-950/90 border border-slate-800 flex items-center justify-between text-xs shadow-md'
+                    : `w-full max-w-[296px] sm:max-w-[416px] h-9 px-3 rounded-xl bg-slate-950/90 border flex items-center justify-between text-xs transition-all flex-shrink-0 box-border ${topPlayerTurn
+                        ? 'border-purple-400/60 shadow-[0_0_12px_rgba(192,132,252,0.35)]'
+                        : 'border-slate-800 shadow-md'
+                      }`
                 }
               >
                 <div className="flex items-center gap-2 min-w-0">
                   <img
                     src={topPlayerProfile.avatar_url}
                     alt={topPlayerProfile.username}
-                    className="w-6 h-6 rounded-full object-cover border border-purple-400/70"
+                    className="w-6 h-6 rounded-full object-cover border border-purple-400/70 flex-shrink-0"
                   />
                   <span className="font-bold text-slate-200 truncate">
                     {topPlayerProfile.username}
                   </span>
                   <span
-                    className={`px-1.5 py-0.5 rounded text-[9px] font-extrabold uppercase ${topPlayerProfile.colorCode === 'w'
+                    className={`px-1.5 py-0.5 rounded text-[9px] font-extrabold uppercase flex-shrink-0 ${topPlayerProfile.colorCode === 'w'
                         ? 'bg-amber-200 text-slate-950'
                         : 'bg-slate-800 text-cyan-300 border border-cyan-500/40'
                       }`}
@@ -4948,9 +4958,9 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
                   </span>
                 </div>
                 <div
-                  className={`px-2 py-0.5 rounded-md font-mono font-bold text-xs flex items-center gap-1 ${topPlayerTurn
-                      ? 'bg-purple-500/25 text-purple-200 border border-purple-400/60'
-                      : 'bg-slate-900 text-slate-400'
+                  className={`h-6 px-2 rounded-md font-mono font-bold text-xs flex items-center gap-1 border transition-all flex-shrink-0 box-border ${topPlayerTurn
+                      ? 'bg-purple-500/25 text-purple-200 border-purple-400/60 shadow-[0_0_8px_rgba(192,132,252,0.4)]'
+                      : 'bg-slate-900 text-slate-400 border-transparent'
                     }`}
                 >
                   <Clock className="w-3 h-3 text-purple-400" />
@@ -4960,28 +4970,20 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
 
               {/* Exact Reference Board Frame with Custom Uploaded 2D Board & Pieces */}
               <div
-                className={
-                  isFullScreen
-                    ? 'relative w-full h-full max-w-full max-h-full aspect-square flex items-center justify-center select-none'
-                    : 'relative w-[340px] xs:w-[380px] sm:w-[460px] md:w-[500px] lg:w-[530px] max-w-[94vw] max-h-[72vh] aspect-square flex items-center justify-center select-none'
-                }
-                style={
-                  isFullScreen
-                    ? {
-                      width: '100%',
-                      height: '100%',
-                      maxWidth: '100%',
-                      maxHeight: '100%',
-                      aspectRatio: '1 / 1',
-                    }
-                    : undefined
-                }
+                className="relative flex items-center justify-center select-none flex-shrink-0"
+                style={{
+                  width: isFullScreen ? 'min(94vw, 86vh)' : 'min(100%, 92vw, 68vh, 520px)',
+                  height: 'auto',
+                  aspectRatio: '1 / 1',
+                  maxWidth: '100%',
+                  maxHeight: '100%',
+                }}
               >
                 {/* 1. Custom Uploaded Chessboard Image (Pristine 1:1 square 8x8 foundation, always fixed orientation) */}
                 <img
                   src="/assets/reference_board_clean_square.png"
                   alt="ChessVerse Board"
-                  className="w-full h-full object-contain pointer-events-none select-none drop-shadow-[0_16px_48px_rgba(0,0,0,0.85)]"
+                  className="w-full h-full object-fill pointer-events-none select-none drop-shadow-[0_16px_48px_rgba(0,0,0,0.85)]"
                   draggable={false}
                 />
 
@@ -4993,13 +4995,26 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
                     top: '9.375%',
                     width: '81.25%',
                     height: '81.25%',
+                    margin: 0,
+                    padding: 0,
                   }}
                 >
                   {/* Interactive 8x8 Grid for Touch, Click, Drag-and-Drop, and Custom Pieces */}
                   <div
                     ref={grid2DContainerRef}
                     data-testid="chess-2d-grid"
-                    className="absolute inset-0 grid grid-cols-8 grid-rows-8 z-20 touch-none select-none"
+                    className="absolute inset-0 z-20 touch-none select-none"
+                    style={{
+                      display: 'grid',
+                      gridTemplateColumns: 'repeat(8, 12.5%)',
+                      gridTemplateRows: 'repeat(8, 12.5%)',
+                      width: '100%',
+                      height: '100%',
+                      margin: 0,
+                      padding: 0,
+                      gap: 0,
+                      boxSizing: 'border-box',
+                    }}
                     onPointerMove={handle2DPointerMove}
                     onPointerUp={handle2DPointerUp}
                     onPointerCancel={handle2DPointerUp}
@@ -5040,8 +5055,8 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
                             ['--glide-dx' as any]: dx,
                             ['--glide-dy' as any]: dy,
                             animation: isKnight
-                              ? 'chess2dKnightHop 460ms cubic-bezier(0.2, 0.8, 0.2, 1) forwards'
-                              : 'chess2dPieceGlide 420ms cubic-bezier(0.25, 1, 0.5, 1) forwards',
+                              ? 'chess2dKnightHop 400ms cubic-bezier(0.2, 0.8, 0.2, 1) forwards'
+                              : 'chess2dPieceGlide 380ms cubic-bezier(0.25, 1, 0.5, 1) forwards',
                             zIndex: 35,
                           };
                         } else if (isCastlingRook && active2DMove && active2DMove.rookFrom && active2DMove.rookTo) {
@@ -5051,7 +5066,7 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
                           pieceAnimStyle = {
                             ['--glide-dx' as any]: dx,
                             ['--glide-dy' as any]: 0,
-                            animation: 'chess2dPieceGlide 420ms cubic-bezier(0.25, 1, 0.5, 1) forwards',
+                            animation: 'chess2dPieceGlide 380ms cubic-bezier(0.25, 1, 0.5, 1) forwards',
                             zIndex: 35,
                           };
                         }
@@ -5070,7 +5085,16 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
                             }
                             onPointerDown={(e) => handle2DPointerDown(e, sqName)}
                             onClick={() => handleSquareSelection(sqName)}
-                            className="relative w-full h-full flex items-center justify-center select-none bg-transparent focus:outline-none cursor-pointer group"
+                            className="relative flex items-center justify-center select-none bg-transparent focus:outline-none cursor-pointer p-0 m-0 border-0"
+                            style={{
+                              width: '100%',
+                              height: '100%',
+                              padding: 0,
+                              margin: 0,
+                              border: 0,
+                              boxSizing: 'border-box',
+                              overflow: 'visible',
+                            }}
                           >
                             {/* Transient Move Source Highlight */}
                             {isTransientMoveSource && (
@@ -5133,19 +5157,25 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
                             {/* Custom Uploaded Chess Piece (Centered, Proportional, Transparent RGBA) */}
                             {piece && (
                               <div
+                                key={`${piece.color}${piece.type}-${sqName}`}
                                 style={pieceAnimStyle}
                                 data-testid={`piece-${sqName}`}
-                                className={`absolute inset-0 flex items-center justify-center pointer-events-none transition-transform duration-150 ${isDragged
-                                    ? 'opacity-20 scale-95'
+                                className={`absolute inset-0 flex items-center justify-center pointer-events-none p-0.5 z-10 ${isDragged
+                                    ? 'opacity-25'
                                     : isSelected
-                                      ? 'scale-105 -translate-y-1 drop-shadow-[0_4px_12px_rgba(34,211,238,0.85)] z-30'
-                                      : 'group-hover:scale-105 drop-shadow-[0_2px_4px_rgba(0,0,0,0.5)] z-10'
+                                      ? 'drop-shadow-[0_4px_12px_rgba(34,211,238,0.9)] z-30'
+                                      : 'drop-shadow-[0_2px_4px_rgba(0,0,0,0.5)]'
                                   }`}
                               >
                                 <img
                                   src={PIECE_IMAGE_MAP[`${piece.color}${piece.type}`]}
                                   alt={`${piece.color === 'w' ? 'White' : 'Black'} ${piece.type}`}
-                                  className="w-full h-full object-contain select-none pointer-events-none"
+                                  className="w-[94%] h-[94%] object-contain select-none pointer-events-none"
+                                  style={{
+                                    maxWidth: '94%',
+                                    maxHeight: '94%',
+                                    transform: 'none',
+                                  }}
                                   draggable={false}
                                 />
                               </div>
@@ -5157,7 +5187,7 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
                                 data-testid={`legal-move-${sqName}`}
                                 className={`z-40 pointer-events-none ${piece
                                     ? 'absolute inset-1.5 rounded-full border-[3px] border-rose-500/90 shadow-[0_0_10px_#f43f5e]'
-                                    : 'w-3.5 h-3.5 rounded-full bg-cyan-400/90 shadow-[0_0_10px_#22d3ee]'
+                                    : 'absolute inset-0 m-auto w-3.5 h-3.5 rounded-full bg-cyan-400/90 shadow-[0_0_10px_#22d3ee]'
                                   }`}
                               />
                             )}
@@ -5175,16 +5205,16 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
                     style={{
                       left: dragged2DPiece.clientX,
                       top: dragged2DPiece.clientY,
-                      width: '80px',
-                      height: '80px',
-                      transform: 'translate(-50%, -50%) scale(1.12)',
+                      width: `${grid2DContainerRef.current ? grid2DContainerRef.current.clientWidth / 8 : 54}px`,
+                      height: `${grid2DContainerRef.current ? grid2DContainerRef.current.clientHeight / 8 : 54}px`,
+                      transform: 'translate(-50%, -50%)',
                       filter: 'drop-shadow(0 8px 16px rgba(0,0,0,0.65)) drop-shadow(0 0 10px rgba(34,211,238,0.75))',
                     }}
                   >
                     <img
                       src={PIECE_IMAGE_MAP[`${dragged2DPiece.color}${dragged2DPiece.type}`]}
                       alt="Dragged Piece"
-                      className="w-full h-full object-contain"
+                      className="w-[94%] h-[94%] object-contain p-0.5"
                       draggable={false}
                     />
                   </div>
@@ -5197,21 +5227,24 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
                 className={
                   isFullScreen
                     ? 'hidden'
-                    : 'w-[296px] sm:w-[416px] px-3 py-1.5 rounded-xl bg-slate-950/90 border border-cyan-500/35 flex items-center justify-between text-xs shadow-md'
+                    : `w-full max-w-[296px] sm:max-w-[416px] h-9 px-3 rounded-xl bg-slate-950/90 border flex items-center justify-between text-xs transition-all flex-shrink-0 box-border ${bottomPlayerTurn
+                        ? 'border-cyan-400/60 shadow-[0_0_12px_rgba(34,211,238,0.35)]'
+                        : 'border-slate-800 shadow-md'
+                      }`
                 }
               >
                 <div className="flex items-center gap-2 min-w-0">
                   <img
                     src={bottomPlayerProfile.avatar_url}
                     alt={bottomPlayerProfile.username}
-                    className="w-6 h-6 rounded-full object-cover border border-cyan-400"
+                    className="w-6 h-6 rounded-full object-cover border border-cyan-400 flex-shrink-0"
                   />
                   <span className="font-bold text-white truncate">
                     {bottomPlayerProfile.username}
                   </span>
                   <span
                     data-testid="bottom-player-color-indicator"
-                    className={`px-1.5 py-0.5 rounded text-[9px] font-extrabold uppercase ${bottomPlayerProfile.colorCode === 'w'
+                    className={`px-1.5 py-0.5 rounded text-[9px] font-extrabold uppercase flex-shrink-0 ${bottomPlayerProfile.colorCode === 'w'
                         ? 'bg-amber-200 text-slate-950'
                         : 'bg-slate-800 text-cyan-300 border border-cyan-500/40'
                       }`}
@@ -5220,9 +5253,9 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
                   </span>
                 </div>
                 <div
-                  className={`px-2 py-0.5 rounded-md font-mono font-bold text-xs flex items-center gap-1 ${bottomPlayerTurn
-                      ? 'bg-cyan-500/25 text-cyan-200 border border-cyan-400/60'
-                      : 'bg-slate-900 text-slate-400'
+                  className={`h-6 px-2 rounded-md font-mono font-bold text-xs flex items-center gap-1 border transition-all flex-shrink-0 box-border ${bottomPlayerTurn
+                      ? 'bg-cyan-500/25 text-cyan-200 border-cyan-400/60 shadow-[0_0_8px_rgba(34,211,238,0.4)]'
+                      : 'bg-slate-900 text-slate-400 border-transparent'
                     }`}
                 >
                   <Clock className="w-3 h-3 text-cyan-400" />
@@ -5238,7 +5271,7 @@ export const Chess3DGame: React.FC<Chess3DGameProps> = ({
             className={
               isFullScreen
                 ? 'hidden'
-                : `hidden lg:flex flex-col gap-3 transition-all duration-300 ease-in-out flex-shrink-0 pointer-events-auto overflow-hidden ${showSidePanels
+                : `hidden lg:flex flex-col gap-3 transition-all duration-300 ease-in-out flex-shrink-0 pointer-events-auto overflow-hidden max-h-full ${showSidePanels
                   ? 'w-52 p-3 opacity-100 translate-x-0'
                   : 'w-0 p-0 opacity-0 translate-x-8 border-0'
                 }`

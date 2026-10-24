@@ -130,7 +130,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             <div>
               <h3 className="text-lg font-black text-white tracking-tight">Settings & Account</h3>
               <p className="text-xs text-slate-400">
-                UID: <span className="font-mono text-cyan-400 font-bold">{currentUser.id}</span>
+                UID: <span className="font-mono text-cyan-400 font-bold">{currentUser.public_uid}</span>
               </p>
             </div>
           </div>
