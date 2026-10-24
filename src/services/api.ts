@@ -402,6 +402,7 @@ class WebSocketClient {
   private listeners: Map<string, Set<EventCallback>> = new Map();
   private subscribedRooms: Set<string> = new Set();
   private reconnectTimer: any = null;
+  private pingInterval: any = null;
   private currentToken: string | null = null;
   private isAuthenticated = false;
 
@@ -417,6 +418,7 @@ class WebSocketClient {
       (this.socket.readyState === WebSocket.OPEN ||
         this.socket.readyState === WebSocket.CONNECTING)
     ) {
+      this.stopHeartbeat();
       this.socket.close();
       this.socket = null;
       this.isAuthenticated = false;
@@ -427,6 +429,10 @@ class WebSocketClient {
       (this.socket.readyState === WebSocket.OPEN ||
         this.socket.readyState === WebSocket.CONNECTING)
     ) {
+      // Re-send auth if socket is open but not yet marked authenticated
+      if (this.socket.readyState === WebSocket.OPEN && !this.isAuthenticated) {
+        this.socket.send(JSON.stringify({ type: 'auth', token: authToken }));
+      }
       return;
     }
 
@@ -448,17 +454,25 @@ class WebSocketClient {
       wsUrl = `${protocol}//${window.location.host}/ws`;
     }
 
+    // Attach token in query param for instant connection handshake auth
+    const sep = wsUrl.includes('?') ? '&' : '?';
+    const connectUrl = `${wsUrl}${sep}token=${encodeURIComponent(authToken)}`;
+
     try {
-      this.socket = new WebSocket(wsUrl);
+      this.socket = new WebSocket(connectUrl);
 
       this.socket.onopen = () => {
         this.socket?.send(JSON.stringify({ type: 'auth', token: authToken }));
+        this.startHeartbeat();
       };
 
       this.socket.onmessage = (event) => {
         try {
           const payload = JSON.parse(event.data);
           const { type, ...data } = payload;
+          if (type === 'pong') {
+            return;
+          }
           if (type === 'auth_success') {
             this.isAuthenticated = true;
             // Subscribe to all active rooms on connect/reconnect once authorized
@@ -474,6 +488,7 @@ class WebSocketClient {
       };
 
       this.socket.onclose = () => {
+        this.stopHeartbeat();
         this.socket = null;
         this.isAuthenticated = false;
         clearTimeout(this.reconnectTimer);
@@ -486,11 +501,36 @@ class WebSocketClient {
       };
 
       this.socket.onerror = () => {
+        this.stopHeartbeat();
         this.socket?.close();
       };
     } catch (err) {
       console.warn('WS connection failed, retrying:', err);
     }
+  }
+
+  private startHeartbeat() {
+    this.stopHeartbeat();
+    this.pingInterval = setInterval(() => {
+      if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+        try {
+          this.socket.send(JSON.stringify({ type: 'ping' }));
+        } catch {
+          // ignore
+        }
+      }
+    }, 20000);
+  }
+
+  private stopHeartbeat() {
+    if (this.pingInterval) {
+      clearInterval(this.pingInterval);
+      this.pingInterval = null;
+    }
+  }
+
+  isConnected(): boolean {
+    return !!(this.socket && this.socket.readyState === WebSocket.OPEN && this.isAuthenticated);
   }
 
   subscribeRoom(roomId: string) {
@@ -543,8 +583,10 @@ class WebSocketClient {
 
   disconnect() {
     clearTimeout(this.reconnectTimer);
+    this.stopHeartbeat();
     this.subscribedRooms.clear();
     this.isAuthenticated = false;
+    this.currentToken = null;
     if (this.socket) {
       this.socket.close();
       this.socket = null;

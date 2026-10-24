@@ -491,16 +491,28 @@ function getRoomPlayersPayload(room: GameRoomRecord) {
   };
 }
 
-function sendToUser(userId: string, event: string, payload: any) {
+function sendToUser(userId: string, event: string, payload: any): boolean {
   const sockets = activeSockets.get(userId);
+  let delivered = false;
   if (sockets) {
     const msg = JSON.stringify({ type: event, ...payload });
-    for (const ws of sockets) {
+    for (const ws of Array.from(sockets)) {
       if (ws.readyState === WebSocket.OPEN) {
-        ws.send(msg);
+        try {
+          ws.send(msg);
+          delivered = true;
+        } catch (e) {
+          console.error(`Error sending ${event} to user ${userId}:`, e);
+        }
+      } else if (ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+        sockets.delete(ws);
       }
     }
+    if (sockets.size === 0) {
+      activeSockets.delete(userId);
+    }
   }
+  return delivered;
 }
 
 function broadcastToRoom(room: GameRoomRecord, event: string, payload: any) {
@@ -554,9 +566,27 @@ function broadcastPresence(userId: string, isOnline: boolean) {
   }
 }
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
   let authenticatedUserId: string | null = null;
   const socketRooms = new Set<string>();
+
+  // Check URL query parameters for token (e.g., /ws?token=...) for immediate handshake auth
+  try {
+    const reqUrl = req.url || '';
+    const urlObj = new URL(reqUrl, 'http://localhost');
+    const queryToken = urlObj.searchParams.get('token');
+    if (queryToken && sessions[queryToken] && db.users[sessions[queryToken].userId]) {
+      authenticatedUserId = sessions[queryToken].userId;
+      if (!activeSockets.has(authenticatedUserId)) {
+        activeSockets.set(authenticatedUserId, new Set());
+      }
+      activeSockets.get(authenticatedUserId)!.add(ws);
+      ws.send(JSON.stringify({ type: 'auth_success', userId: authenticatedUserId }));
+      broadcastPresence(authenticatedUserId, true);
+    }
+  } catch (e) {
+    // Ignore URL parse errors
+  }
 
   ws.on('message', (data) => {
     try {
@@ -564,6 +594,13 @@ wss.on('connection', (ws) => {
       if (msg.type === 'auth') {
         const session = sessions[msg.token];
         if (session && db.users[session.userId]) {
+          if (authenticatedUserId && authenticatedUserId !== session.userId) {
+            const oldSet = activeSockets.get(authenticatedUserId);
+            if (oldSet) {
+              oldSet.delete(ws);
+              if (oldSet.size === 0) activeSockets.delete(authenticatedUserId);
+            }
+          }
           authenticatedUserId = session.userId;
           if (!activeSockets.has(authenticatedUserId)) {
             activeSockets.set(authenticatedUserId, new Set());
@@ -575,6 +612,8 @@ wss.on('connection', (ws) => {
         } else {
           ws.send(JSON.stringify({ type: 'auth_error', message: 'Invalid token' }));
         }
+      } else if (msg.type === 'ping') {
+        ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
       } else if (msg.type === 'join_room' && authenticatedUserId && msg.roomId) {
         const room = db.game_rooms[msg.roomId];
         if (room && isAuthorizedInRoom(room, authenticatedUserId)) {
@@ -1460,12 +1499,23 @@ app.post('/api/invitations/send', authMiddleware, (req: Request, res: Response):
 
   // Deliver the invitation ONLY to the intended invitee account
   if (!isPureBotInvitee) {
-    sendToUser(resolvedInviteeId, 'game_invitation', {
+    const inviter = db.users[userId];
+    const safeInviter = inviter
+      ? {
+          id: inviter.id,
+          username: inviter.username,
+          avatar_url: inviter.avatar_url,
+          public_uid: inviter.public_uid,
+        }
+      : null;
+
+    const delivered = sendToUser(resolvedInviteeId, 'game_invitation', {
       invitation: {
         ...invitation,
-        inviter: (req as any).user,
+        inviter: safeInviter,
       },
     });
+    console.log(`[Invitations] Sent invitation ${invitation.id} to ${resolvedInviteeId}. Live WS delivered: ${delivered}`);
   }
 
   res.status(201).json({ invitation, room });
@@ -1508,12 +1558,21 @@ app.post('/api/invitations/respond', authMiddleware, (req: Request, res: Respons
     }
 
     const playersPayload = room ? getRoomPlayersPayload(room) : undefined;
+    const accepter = db.users[userId];
+    const safeAccepter = accepter
+      ? {
+          id: accepter.id,
+          username: accepter.username,
+          avatar_url: accepter.avatar_url,
+          public_uid: accepter.public_uid,
+        }
+      : null;
 
     sendToUser(inv.inviter_id, 'invitation_accepted', {
       invitationId,
       roomId: inv.room_id,
       gameType: inv.game_type,
-      accepter: (req as any).user,
+      accepter: safeAccepter,
       room,
       players: playersPayload,
     });

@@ -8,6 +8,7 @@ import { Navbar } from './components/Navbar.tsx';
 import { Sidebar } from './components/Sidebar.tsx';
 import { AuthModal } from './components/AuthModal.tsx';
 import { HomeDashboard } from './components/HomeDashboard.tsx';
+import { Crown, X } from 'lucide-react';
 
 // Code-split heavy components for instant initial page loading & reduced memory footprint
 const Chess3DGame = lazy(() =>
@@ -60,6 +61,7 @@ export default function App() {
 
   // Real-time state
   const [invitations, setInvitations] = useState<GameInvitation[]>([]);
+  const [incomingChallenge, setIncomingChallenge] = useState<GameInvitation | null>(null);
   const [friends, setFriends] = useState<UserProfile[]>([]);
   const [pendingRequests, setPendingRequests] = useState<any[]>([]);
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -69,6 +71,29 @@ export default function App() {
     ttt: [],
   });
   const [onlineCount] = useState<number>(6);
+
+  const playInviteSound = () => {
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      const now = ctx.currentTime;
+      osc.frequency.setValueAtTime(523.25, now); // C5
+      osc.frequency.setValueAtTime(659.25, now + 0.1); // E5
+      osc.frequency.setValueAtTime(783.99, now + 0.2); // G5
+      gain.gain.setValueAtTime(0.18, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.45);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now);
+      osc.stop(now + 0.45);
+    } catch {
+      // Audio playback restrictions fallback
+    }
+  };
 
   const showToast = (msg: string) => {
     setToastMessage(msg);
@@ -187,9 +212,57 @@ export default function App() {
 
   useEffect(() => {
     if (currentUser?.id) {
+      const token = getAuthToken();
+      if (token) {
+        wsService.connect(token);
+      }
       refreshAppData();
+    } else {
+      wsService.disconnect();
     }
   }, [currentUser?.id, refreshAppData]);
+
+  // Periodic background check for pending invitations & instant check on window/tab focus
+  useEffect(() => {
+    if (!currentUser?.id) return;
+
+    const checkInvitations = async () => {
+      try {
+        const res = await api.getInvitations();
+        if (Array.isArray(res.invitations)) {
+          setInvitations((prev) => {
+            const existingIds = new Set(prev.map((i) => i.id));
+            const newOnes = res.invitations.filter((i) => !existingIds.has(i.id));
+            if (newOnes.length > 0) {
+              setIncomingChallenge(newOnes[0]);
+              playInviteSound();
+            }
+            return res.invitations;
+          });
+        }
+      } catch {
+        // Silently ignore background polling errors
+      }
+    };
+
+    const interval = setInterval(checkInvitations, 8000);
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        const token = getAuthToken();
+        if (token) wsService.connect(token);
+        checkInvitations();
+      }
+    };
+    window.addEventListener('visibilitychange', onVisibilityChange);
+    window.addEventListener('focus', onVisibilityChange);
+
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener('visibilitychange', onVisibilityChange);
+      window.removeEventListener('focus', onVisibilityChange);
+    };
+  }, [currentUser?.id]);
 
   // WebSocket global real-time event listeners
   useEffect(() => {
@@ -198,7 +271,12 @@ export default function App() {
     const unsubs = [
       wsService.on('game_invitation', (data: any) => {
         if (data.invitation) {
-          setInvitations((prev) => [data.invitation, ...prev]);
+          setInvitations((prev) => {
+            const filtered = prev.filter((i) => i.id !== data.invitation.id);
+            return [data.invitation, ...filtered];
+          });
+          setIncomingChallenge(data.invitation);
+          playInviteSound();
         }
       }),
 
@@ -250,6 +328,7 @@ export default function App() {
 
   const handleAcceptInvitation = async (inv: GameInvitation) => {
     try {
+      setIncomingChallenge(null);
       const res = await api.respondInvitation(inv.id, 'accept');
       setInvitations((prev) => prev.filter((i) => i.id !== inv.id));
       handleNavigate(inv.game_type === 'chess' ? 'chess' : 'ttt', { roomId: res.roomId });
@@ -260,8 +339,10 @@ export default function App() {
 
   const handleDeclineInvitation = async (inv: GameInvitation) => {
     try {
+      setIncomingChallenge(null);
       await api.respondInvitation(inv.id, 'decline');
       setInvitations((prev) => prev.filter((i) => i.id !== inv.id));
+      showToast('Game challenge declined');
     } catch (err) {
       console.error('Failed to decline invitation:', err);
     }
@@ -291,12 +372,14 @@ export default function App() {
 
   const handleLogout = () => {
     clearAuthToken();
+    wsService.disconnect();
     setCurrentUser(null);
     setActiveView('dashboard');
   };
 
   const handleDeleteAccount = () => {
     clearAuthToken();
+    wsService.disconnect();
     setCurrentUser(null);
     setActiveView('dashboard');
   };
@@ -322,7 +405,17 @@ export default function App() {
 
   // If not authenticated, render login/registration modal
   if (!currentUser) {
-    return <AuthModal onSuccess={(user) => setCurrentUser(user)} />;
+    return (
+      <AuthModal
+        onSuccess={(user) => {
+          setCurrentUser(user);
+          const token = getAuthToken();
+          if (token) {
+            wsService.connect(token);
+          }
+        }}
+      />
+    );
   }
 
   return (
@@ -331,6 +424,74 @@ export default function App() {
       {toastMessage && (
         <div className="fixed top-16 right-4 z-50 px-4 py-2.5 rounded-xl bg-slate-900/95 border border-cyan-500/40 text-cyan-300 text-xs font-bold shadow-2xl">
           {toastMessage}
+        </div>
+      )}
+
+      {/* Real-time Incoming Game Invitation Modal Overlay */}
+      {incomingChallenge && (
+        <div className="fixed inset-x-4 top-20 sm:top-20 max-w-md mx-auto z-[9999] animate-in fade-in slide-in-from-top-4 duration-300 pointer-events-auto">
+          <div className="relative overflow-hidden rounded-2xl bg-slate-900/98 border-2 border-cyan-400/80 shadow-2xl shadow-cyan-950/80 p-4.5 backdrop-blur-2xl">
+            {/* Top glowing ambient accent */}
+            <div className="absolute top-0 inset-x-0 h-1 bg-gradient-to-r from-transparent via-cyan-400 to-transparent animate-pulse" />
+
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-center gap-3 min-w-0">
+                <div className="relative shrink-0">
+                  <img
+                    src={
+                      incomingChallenge.inviter?.avatar_url ||
+                      `https://api.dicebear.com/7.x/bottts/svg?seed=${incomingChallenge.inviter?.username || 'user'}`
+                    }
+                    alt={incomingChallenge.inviter?.username || 'Challenger'}
+                    className="w-12 h-12 rounded-full object-cover border-2 border-cyan-400 shadow-md shadow-cyan-500/30"
+                  />
+                  <span className="absolute -bottom-0.5 -right-0.5 w-3.5 h-3.5 bg-emerald-500 border-2 border-slate-950 rounded-full" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider bg-cyan-500/20 text-cyan-300 border border-cyan-500/40">
+                      Incoming Challenge
+                    </span>
+                    <span className="text-[10px] font-mono text-slate-400 uppercase">
+                      {incomingChallenge.game_type === 'chess' ? '3D Chess' : 'Tic-Tac-Toe'}
+                    </span>
+                  </div>
+                  <h4 className="font-extrabold text-sm sm:text-base text-white mt-1 truncate">
+                    {incomingChallenge.inviter?.username || 'Player'}
+                  </h4>
+                  <p className="text-xs text-cyan-300/80">
+                    Challenged you to a live {incomingChallenge.game_type === 'chess' ? 'Chess' : 'Tic-Tac-Toe'} match!
+                  </p>
+                </div>
+              </div>
+
+              {/* Dismiss button */}
+              <button
+                onClick={() => setIncomingChallenge(null)}
+                aria-label="Dismiss challenge popup"
+                className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors shrink-0 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Accept & Decline Actions */}
+            <div className="flex items-center gap-2.5 mt-4 pt-3 border-t border-slate-800/80">
+              <button
+                onClick={() => handleAcceptInvitation(incomingChallenge)}
+                className="flex-1 py-2.5 px-4 bg-gradient-to-r from-cyan-400 via-cyan-500 to-blue-600 hover:brightness-110 text-black font-extrabold text-xs rounded-xl shadow-lg shadow-cyan-500/25 transition-all flex items-center justify-center gap-2 cursor-pointer active:scale-95"
+              >
+                <Crown className="w-4 h-4" />
+                Accept & Play Now
+              </button>
+              <button
+                onClick={() => handleDeclineInvitation(incomingChallenge)}
+                className="py-2.5 px-4 bg-slate-800/90 hover:bg-rose-950/60 hover:text-rose-300 text-slate-300 font-bold text-xs rounded-xl border border-slate-700/60 transition-colors cursor-pointer active:scale-95"
+              >
+                Decline
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
