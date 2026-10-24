@@ -21,7 +21,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
-const DATA_DIR = path.join(__dirname, '.data');
+const DATA_DIR = process.env.VERCEL ? path.join('/tmp', '.data') : path.join(__dirname, '.data');
 const DB_FILE = path.join(DATA_DIR, 'db.json');
 
 if (!fs.existsSync(DATA_DIR)) {
@@ -2068,4 +2068,17 @@ async function startServer() {
   });
 }
 
-startServer();
+if (!process.env.VERCEL) {
+  startServer();
+}
+
+export default function handler(req: any, res: any) {
+  if (req.url && !req.url.startsWith('/api') && !req.url.startsWith('/ws')) {
+    req.url = '/api' + req.url;
+  }
+  return (app as any)(req, res);
+}
+
+export { app };
+
+
